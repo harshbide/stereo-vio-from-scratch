@@ -1,132 +1,134 @@
-# Stereo Visual-Inertial Odometry (VIO) from First Principles
+# GTSAM-free Visual-Inertial Odometry (EuRoC MAV)
 
-A keyframe-based, fixed-lag **stereo visual-inertial odometry** estimator built from scratch: IMU preintegration, stereo VO frontend, factor graph, manifold Levenberg-Marquardt optimizer, and a sliding-window smoother. Evaluated on the **EuRoC MAV** dataset (`V1_01_easy`).
-
-
----
-
-## Overview
-
-The system estimates the full 6-DoF pose, velocity, and IMU biases of a moving rigid body using only stereo images and inertial measurements. No GPS or motion capture is used in estimation (Vicon ground truth is used for evaluation only).
-
-**State (15-D per keyframe):** orientation `R ∈ SO(3)`, velocity `v`, position `p`, gyroscope bias `b_g`, accelerometer bias `b_a`.
-
-Since rotations live on a manifold, all updates use Lie group / Lie algebra operations and the manifold-aware `⊞` (boxplus) operator instead of naive vector addition.
-
-## Key Features
-
-- **IMU preintegration** (Forster et al.) with first-order bias correction, no re-integration on bias updates
-- **Stereo VO frontend**: feature detection, epipolar stereo matching and triangulation (metric scale), KLT tracking, PnP + RANSAC relative pose
-- **Static initialization**: variance-based static window search, gyro bias estimation, gravity alignment, accel bias along gravity
-- **Factor graph** with IMU, visual-odometry, and zero-velocity (ZUPT) factors
-- **Manifold Levenberg-Marquardt** with cost-based step acceptance and per-block step limits
-- **Fixed-lag sliding-window smoother** for jointly optimizing the last N keyframes, letting bias errors be corrected after the fact
-- **Evaluation tools**: Umeyama alignment, SE(3)-aligned ATE, and RPE
-
-## Pipeline
+A from-scratch Python implementation of the pipeline in your diagram:
 
 ```
-for each new keyframe timestamp t_k:
-    1. Preintegrate IMU samples since last keyframe
-    2. Run stereo VO frontend on the new image pair  -> relative R, t
-    3. Check VO / IMU consistency; build factor list
-    4. Check stationarity; optionally add a ZUPT factor
-    5. Insert new node into the sliding window
-    6. Jointly optimize the window (manifold LM)
-    7. If window exceeds size limit, freeze + archive the oldest node
+Camera -> Feature tracking -> Visual odometry  \
+                                                  >-- Jacobian blocks -> Block accumulation (J^T W J) -> Solve H*dx=b -> Update pose -> repeat
+IMU data -> IMU factor computation (preintegration) /
 ```
 
-## Methodology Summary
+No GTSAM anywhere — the factor-graph math (SO(3) Lie algebra, IMU
+preintegration, analytic Jacobians, Gauss-Newton normal equations) is
+implemented directly with numpy/scipy. Visual odometry uses OpenCV
+(stereo triangulation + optical flow + PnP).
 
-| Stage | Approach |
-| --- | --- |
-| IMU model | Gyro = true rate + bias + noise; accel = specific force (gravity-compensated, body frame) + bias + noise |
-| Preintegration | Relative motion (ΔR, Δv, Δp) integrated once between keyframes, Jacobians accumulated for bias correction |
-| Visual frontend | Shi-Tomasi/FAST corners, stereo triangulation, KLT tracking, PnP-RANSAC + LM refinement |
-| Initialization | Static window scored on gyro variance, accel variance, and `‖a‖ ≈ 9.81 m/s²` |
-| IMU factor | 15-D residual (rotation, velocity, position, bias random walk) |
-| VO factor | Relative pose residual, weights inflated when PnP inlier count is low |
-| ZUPT factor | Zero-velocity constraint when stationarity is detected; the only absolute constraint, it bounds long-horizon drift |
-| Optimizer | Gauss-Newton normal equations + adaptive LM damping on the manifold |
-| Smoother | Fixed-lag window, oldest node anchored, numerical Jacobian for the older node |
+Architecture note: at every keyframe, only the **new** keyframe's state
+is free (15-dim: rotation, velocity, position, gyro bias, accel bias);
+the previous keyframe's state is treated as fixed. That's what keeps
+the "block accumulation -> solve" step a genuinely small 15x15 linear
+solve every time, instead of a growing bundle-adjustment problem — it's
+an incremental/marginalized (filter-like) formulation, well suited to
+the FPGA/ARM split your diagram describes.
 
-## Dataset
-
-[EuRoC MAV Dataset](https://projects.asl.ethz.ch/datasets/doku.php?id=kmavvisualinertialdatasets), sequence **V1_01_easy**: stereo camera pair (cam0, cam1), ~200 Hz IMU, Vicon ground truth (evaluation only).
-
-## Results
-
-SE(3)-aligned ATE and relative position error across the debugging and tuning progression:
-
-| Configuration | SE(3)-Aligned RMSE | Relative Pos. RMSE | Notes |
-| --- | --- | --- | --- |
-| Original / unfixed | 643.70 m | 20.50 m | Divergent baseline |
-| + static-window search & ZUPT (w=5, 60 s) | 0.156 m | 0.048 m | First healthy result |
-| + static-window search & ZUPT (w=5, 143 s) | 0.680 m | 0.098 m | Full sequence |
-| Sliding window, size 8 (60 s) | 0.064 m | 0.023 m | Window-reach ablation |
-| Sliding window, size 8 (143 s, full) | **0.280 m** | **0.050 m** | **Best full-sequence result** |
-| Sliding window, size 12 (120 s) | 0.156 m | 0.028 m | Not yet run full-length |
-
-The ~1000x improvement came from two root-cause fixes (an over-permissive outlier gate in the VO frontend, and cost-based step acceptance in the optimizer), followed by giving the smoother more temporal reach. Larger windows cost roughly cubic compute per keyframe, so accuracy gains must be weighed against runtime.
-
-## Development Methodology
-
-- **Symptom characterization**: error-vs-time curve shapes used to classify failure modes before touching code
-- **Synthetic tests**: each fix validated on hand-built scenarios reproducing the failure signature
-- **Ablations**: window size and factor inclusion varied one at a time on fixed time slices
-- **Short vs. long horizon validation**: 60 s and full 143 s runs, since several bugs only appeared over long integration
-
-## Repository Structure
-
-> Adjust to match your actual layout.
+## Project layout
 
 ```
-.
-├── README.md
-├── docs/
-│   └── VIO_Methodology_and_Algorithms.docx
-├── src/
-│   ├── imu_preintegration/
-│   ├── vo_frontend/
-│   ├── initialization/
-│   ├── factors/
-│   ├── optimizer/
-│   └── smoother/
-├── eval/
-│   └── ate_rpe.py
-├── tests/
-└── results/
+vio_project/
+  main.py                  CLI entry point
+  requirements.txt
+  src/
+    lie.py                 SO(3) Exp/Log/right-Jacobian
+    state.py                15-dim NavState + manifold boxplus update
+    imu_preintegration.py   on-manifold IMU preintegration + bias Jacobians
+    dataset.py               EuRoC mav0/ loader (cam0/cam1/imu0/groundtruth)
+    vo_frontend.py            stereo feature tracking -> metric relative pose
+    factors.py                IMU factor + VO factor residuals & Jacobians
+    optimizer.py              Gauss-Newton: J^T W J accumulation + solve
+    pipeline.py               orchestrates the full per-keyframe loop
 ```
 
-## Getting Started
+## 1. Set up the environment (PyCharm)
+
+1. Open this folder (`vio_project/`) as a new PyCharm project.
+2. Create a virtualenv interpreter (PyCharm: *Settings -> Project ->
+   Python Interpreter -> Add -> Virtualenv*), Python 3.10+.
+3. In PyCharm's terminal:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+## 2. Get the EuRoC V1_01_easy sequence
+
+Download the zip from the ASL EuRoC MAV page (the **ASL Dataset Format**,
+not the ROS bag) and extract it so you end up with:
+
+```
+V1_01_easy/
+  mav0/
+    cam0/  {data.csv, data/*.png, sensor.yaml}
+    cam1/  {data.csv, data/*.png, sensor.yaml}
+    imu0/  {data.csv, sensor.yaml}
+    state_groundtruth_estimate0/data.csv
+    ...
+```
+
+`dataset.py` expects exactly this layout — point `--dataset` at the
+folder that directly **contains** `mav0/` (i.e. the `V1_01_easy` folder
+itself, however you named it after unzipping). No editing of the zip's
+internal structure is needed; just unzip it as-is.
+
+## 3. Run it
+
+From the project root, as a PyCharm Run Configuration or from the
+terminal:
 
 ```bash
-git clone https://github.com/<your-username>/<repo-name>.git
-cd <repo-name>
-pip install -r requirements.txt
+# quick smoke test on the first 100 keyframes, with a live plot at the end
+python main.py --dataset /path/to/V1_01_easy --stride 2 --max-keyframes 100 --plot --verbose
 
-# Download EuRoC V1_01_easy and set the dataset path
-python run_vio.py --dataset /path/to/V1_01_easy --window 8
+# full sequence
+python main.py --dataset /path/to/V1_01_easy --stride 2 --out trajectory.csv --plot
 ```
 
-## Limitations and Future Work
+- `--stride N` uses every Nth cam0 frame as a keyframe (larger N = fewer,
+  more-spaced-out keyframes, faster but less accurate VO tracking).
+- Output is a CSV with one row per keyframe: `t, px,py,pz, vx,vy,vz,
+  qw,qx,qy,qz, bgx,bgy,bgz, bax,bay,baz`.
+- `--plot` overlays the estimated trajectory against groundtruth
+  (top-down x/y).
 
-- Sliding-window marginalization is simplified: the oldest node acts as a fixed anchor instead of a full marginalization prior
-- The block-tridiagonal system is currently solved densely
-- Loop closure and global bundle adjustment are not included (VIO only)
-- Window size 12 has not yet been evaluated on the full sequence
-- Only `V1_01_easy` has been evaluated so far
+## 4. What's implemented vs. simplified (read this before trusting numbers)
 
-## References
+This is a working scaffold that has been **unit- and integration-tested**
+(see `tests/` — Jacobians checked against finite differences, IMU
+preintegration checked against closed-form stationary/constant-rate
+cases, stereo geometry checked against synthetic ground truth, and the
+whole pipeline smoke-tested on a synthetic dataset). It is *not* a
+drop-in replacement for a mature system like OKVIS/VINS-Mono/Kimera —
+notably:
 
-- Forster et al., *On-Manifold Preintegration for Real-Time Visual-Inertial Odometry*, IEEE T-RO, 2017
-- Burri et al., *The EuRoC Micro Aerial Vehicle Datasets*, IJRR, 2016
-- Umeyama, *Least-squares estimation of transformation parameters between two point patterns*, IEEE TPAMI, 1991
+- **VO frontend** re-triangulates a fresh stereo point cloud at every
+  keyframe and tracks it exactly one keyframe forward with KLT, so it
+  discards long-track feature history. This keeps it simple but throws
+  away information a real system would keep (longer tracks reduce
+  drift). Good next step if you want to improve accuracy.
+- **No loop closure, no global bundle adjustment.** This is a pure
+  odometry front-to-back filter, so it *will* drift over a long
+  sequence (as does any odometry-only VIO).
+- **Noise parameters** in `imu_preintegration.py` (`gyro_noise_density`
+  etc.) are EuRoC-typical MPU-9250 datasheet numbers — tune if your
+  results look mis-weighted between VO and IMU.
+- **No outlier rejection beyond PnP RANSAC** — no dedicated failure
+  detector for tracking loss on strongly rotating/aggressive motion
+  segments (e.g. V2_03_difficult); start with V1_01_easy as you planned.
+- Initial state uses groundtruth pose if `state_groundtruth_estimate0`
+  is present (fine for evaluating estimator accuracy in isolation); set
+  it to identity/zero yourself if you want a "no groundtruth available"
+  test.
 
-## Author
+## 5. Suggested next steps
 
-**Harsh**, Dept. of Electronics and Telecommunication Engineering, Vishwakarma Institute of Technology, Pune
-
-## License
-
-MIT (or your preferred license)
+1. Run on `V1_01_easy` with `--max-keyframes 100` first to sanity check
+   before a full run.
+2. Plot position error vs. groundtruth (ATE) — a small evaluation script
+   would compare `trajectory.csv` against
+   `mav0/state_groundtruth_estimate0/data.csv`.
+3. Tune `keyframe_stride` and the VO/IMU factor weights
+   (`rot_sigma`/`trans_sigma` in `factors.vo_factor`,
+   `*_noise_density`/`*_bias_rw` in `ImuPreintegrator`) once you see
+   real drift numbers.
+4. If accuracy matters more than embedded-realism, the natural upgrade
+   is a real sliding window (N keyframes free at once, marginalizing
+   the oldest) instead of the 2-node scheme here — bigger H matrix, but
+   still no GTSAM required.
